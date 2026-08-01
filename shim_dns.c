@@ -1,0 +1,349 @@
+/*
+ * shim_dns.c — getaddrinfo(3) fallback for Claude Code on Termux/Android.
+ *
+ * Some Android ROMs symlink /etc to a read-only /system/etc that ships no
+ * resolv.conf. glibc's resolver then starts with zero nameservers and every
+ * lookup fails outright ("getaddrinfo ENOTIMP"), so the glibc build of Claude
+ * Code cannot reach the API even though the network is up.
+ *
+ * This LD_PRELOAD shim wraps getaddrinfo(). The real implementation runs
+ * first, so a working system resolver keeps its normal behaviour (/etc/hosts,
+ * IPv6, NSS). Only when it fails do we fall back to a minimal UDP DNS client
+ * that reads nameservers from the Termux-writable resolv.conf (or the built-in
+ * public defaults) and resolves A records itself.
+ *
+ * Deliberately small: A records only, no search domains, no TCP retry, no
+ * EDNS. It exists to make one HTTPS client work, not to replace libresolv.
+ *
+ * Debug: set CLAUDE_DNS_SHIM_DEBUG=1 to trace decisions on stderr.
+ * Build:  ./build-dns-shim.sh   (needs the glibc toolchain, not the NDK)
+ */
+
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <dlfcn.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <time.h>
+#include <unistd.h>
+
+/* Termux's own resolv.conf lives under $PREFIX/etc, which is writable. */
+#define SHIM_RESOLV_CONF "/data/data/com.termux/files/usr/etc/resolv.conf"
+#define SHIM_NS_FALLBACK_1 "8.8.8.8"
+#define SHIM_NS_FALLBACK_2 "8.8.4.4"
+
+#define SHIM_MAX_NS      4
+#define SHIM_NS_LEN      64
+#define SHIM_MAX_ADDRS   8
+#define SHIM_TIMEOUT_SEC 3
+#define SHIM_DNS_PORT    53
+#define SHIM_PKT_MAX     1500
+
+static void dlog(const char *fmt, ...)
+{
+	if (!getenv("CLAUDE_DNS_SHIM_DEBUG"))
+		return;
+	va_list ap;
+	va_start(ap, fmt);
+	fputs("[dns-shim] ", stderr);
+	vfprintf(stderr, fmt, ap);
+	fputc('\n', stderr);
+	va_end(ap);
+}
+
+/* Resolve the real getaddrinfo once and cache it. */
+typedef int (*ga_fn)(const char *, const char *, const struct addrinfo *,
+		     struct addrinfo **);
+
+static ga_fn real_ga(void)
+{
+	static ga_fn cached;
+	if (!cached)
+		cached = (ga_fn)dlsym(RTLD_NEXT, "getaddrinfo");
+	return cached;
+}
+
+/*
+ * Collect nameservers: resolv.conf first, else the public fallbacks. Only
+ * IPv4 literals are kept — the fallback path speaks UDP/IPv4 to the server.
+ */
+static int load_nameservers(char ns[SHIM_MAX_NS][SHIM_NS_LEN])
+{
+	int n = 0;
+	FILE *f = fopen(SHIM_RESOLV_CONF, "re");
+
+	if (f) {
+		char line[256];
+		while (n < SHIM_MAX_NS && fgets(line, sizeof(line), f)) {
+			char key[16], val[SHIM_NS_LEN];
+			struct in_addr probe;
+
+			if (sscanf(line, "%15s %63s", key, val) != 2)
+				continue;
+			if (strcmp(key, "nameserver") != 0)
+				continue;
+			if (inet_pton(AF_INET, val, &probe) != 1)
+				continue;
+			memcpy(ns[n++], val, strlen(val) + 1);
+		}
+		fclose(f);
+	}
+
+	if (n == 0) {
+		memcpy(ns[n++], SHIM_NS_FALLBACK_1, sizeof(SHIM_NS_FALLBACK_1));
+		memcpy(ns[n++], SHIM_NS_FALLBACK_2, sizeof(SHIM_NS_FALLBACK_2));
+	}
+	return n;
+}
+
+/* Encode "example.com" as length-prefixed DNS labels. Returns bytes used. */
+static int encode_qname(const char *host, unsigned char *out, size_t outlen)
+{
+	size_t used = 0;
+	const char *p = host;
+
+	while (*p) {
+		const char *dot = strchr(p, '.');
+		size_t len = dot ? (size_t)(dot - p) : strlen(p);
+
+		if (len == 0 || len > 63)
+			return -1;               /* empty or oversized label */
+		if (used + len + 2 > outlen)
+			return -1;
+		out[used++] = (unsigned char)len;
+		memcpy(out + used, p, len);
+		used += len;
+		if (!dot)
+			break;
+		p = dot + 1;
+		if (!*p)
+			break;                   /* trailing dot: FQDN form */
+	}
+	if (used + 1 > outlen)
+		return -1;
+	out[used++] = 0;                         /* root label */
+	return (int)used;
+}
+
+/*
+ * Advance past a name at *off*. Compression pointers terminate the name, so
+ * we do not follow them — callers only need the length, never the text.
+ */
+static int skip_name(const unsigned char *pkt, int len, int off)
+{
+	while (off < len) {
+		unsigned char l = pkt[off];
+
+		if (l == 0)
+			return off + 1;
+		if ((l & 0xC0) == 0xC0)
+			return off + 2 <= len ? off + 2 : -1;
+		off += l + 1;
+	}
+	return -1;
+}
+
+/*
+ * One A-record query against one server. Returns the count written to addrs,
+ * or -1 on any transport/parse failure so the caller can try the next server.
+ */
+static int query_a(const char *server, const char *host,
+		   struct in_addr *addrs, int max_addrs)
+{
+	unsigned char pkt[SHIM_PKT_MAX];
+	struct sockaddr_in sa;
+	struct timeval tv;
+	struct timespec ts;
+	int fd, qlen, off, qdcount, ancount, found = 0;
+	uint16_t id;
+	ssize_t n;
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sin_family = AF_INET;
+	sa.sin_port = htons(SHIM_DNS_PORT);
+	if (inet_pton(AF_INET, server, &sa.sin_addr) != 1)
+		return -1;
+
+	/* No rand(): avoid perturbing the host program's PRNG sequence. */
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	id = (uint16_t)((ts.tv_nsec ^ (getpid() << 8)) & 0xFFFF);
+
+	memset(pkt, 0, 12);
+	pkt[0] = id >> 8;
+	pkt[1] = id & 0xFF;
+	pkt[2] = 0x01;                           /* RD — recursion desired */
+	pkt[5] = 0x01;                           /* QDCOUNT = 1 */
+
+	qlen = encode_qname(host, pkt + 12, sizeof(pkt) - 12 - 4);
+	if (qlen < 0)
+		return -1;
+	off = 12 + qlen;
+	pkt[off++] = 0; pkt[off++] = 1;          /* QTYPE  = A  */
+	pkt[off++] = 0; pkt[off++] = 1;          /* QCLASS = IN */
+
+	fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	if (fd < 0)
+		return -1;
+	tv.tv_sec = SHIM_TIMEOUT_SEC;
+	tv.tv_usec = 0;
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+	if (sendto(fd, pkt, off, 0, (struct sockaddr *)&sa, sizeof(sa)) != off) {
+		close(fd);
+		return -1;
+	}
+	n = recvfrom(fd, pkt, sizeof(pkt), 0, NULL, NULL);
+	close(fd);
+
+	if (n < 12)
+		return -1;
+	if (pkt[0] != (id >> 8) || pkt[1] != (id & 0xFF))
+		return -1;                       /* not our transaction */
+	if (pkt[3] & 0x0F) {
+		dlog("rcode=%d from %s", pkt[3] & 0x0F, server);
+		return -1;
+	}
+
+	qdcount = (pkt[4] << 8) | pkt[5];
+	ancount = (pkt[6] << 8) | pkt[7];
+	off = 12;
+	for (int i = 0; i < qdcount; i++) {
+		off = skip_name(pkt, (int)n, off);
+		if (off < 0 || off + 4 > n)
+			return -1;
+		off += 4;                        /* QTYPE + QCLASS */
+	}
+
+	for (int i = 0; i < ancount && found < max_addrs; i++) {
+		int type, rdlen;
+
+		off = skip_name(pkt, (int)n, off);
+		if (off < 0 || off + 10 > n)
+			break;
+		type  = (pkt[off] << 8) | pkt[off + 1];
+		rdlen = (pkt[off + 8] << 8) | pkt[off + 9];
+		off += 10;
+		if (off + rdlen > n)
+			break;
+		if (type == 1 && rdlen == 4)     /* A record */
+			memcpy(&addrs[found++], pkt + off, 4);
+		off += rdlen;                    /* skip CNAME etc. */
+	}
+	return found;
+}
+
+/* Map the service argument to a port. Numeric first, then the two names
+ * that actually matter here; anything else resolves to port 0. */
+static uint16_t resolve_port(const char *service)
+{
+	if (!service || !*service)
+		return 0;
+	char *end;
+	long v = strtol(service, &end, 10);
+	if (*end == '\0' && v >= 0 && v <= 65535)
+		return (uint16_t)v;
+	if (!strcmp(service, "https"))
+		return 443;
+	if (!strcmp(service, "http"))
+		return 80;
+	return 0;
+}
+
+/* Build the addrinfo chain glibc would have returned. */
+static int build_result(const struct in_addr *addrs, int count, uint16_t port,
+			const struct addrinfo *hints, struct addrinfo **res)
+{
+	struct addrinfo *head = NULL, *tail = NULL;
+	int socktype = hints && hints->ai_socktype ? hints->ai_socktype
+						   : SOCK_STREAM;
+	int protocol = hints && hints->ai_protocol ? hints->ai_protocol
+						   : (socktype == SOCK_DGRAM
+						      ? IPPROTO_UDP
+						      : IPPROTO_TCP);
+
+	for (int i = 0; i < count; i++) {
+		struct addrinfo *ai = calloc(1, sizeof(*ai));
+		struct sockaddr_in *sin = calloc(1, sizeof(*sin));
+
+		if (!ai || !sin) {
+			free(ai);
+			free(sin);
+			freeaddrinfo(head);      /* frees what we built so far */
+			return EAI_MEMORY;
+		}
+		sin->sin_family = AF_INET;
+		sin->sin_port = htons(port);
+		sin->sin_addr = addrs[i];
+
+		ai->ai_family = AF_INET;
+		ai->ai_socktype = socktype;
+		ai->ai_protocol = protocol;
+		ai->ai_addrlen = sizeof(*sin);
+		ai->ai_addr = (struct sockaddr *)sin;
+
+		if (tail)
+			tail->ai_next = ai;
+		else
+			head = ai;
+		tail = ai;
+	}
+	if (!head)
+		return EAI_NONAME;
+	*res = head;
+	return 0;
+}
+
+int getaddrinfo(const char *node, const char *service,
+		const struct addrinfo *hints, struct addrinfo **res)
+{
+	ga_fn orig = real_ga();
+	struct in_addr addrs[SHIM_MAX_ADDRS];
+	char ns[SHIM_MAX_NS][SHIM_NS_LEN];
+	int rc, nns;
+
+	if (!orig)                               /* nothing to wrap */
+		return EAI_SYSTEM;
+
+	rc = orig(node, service, hints, res);
+	if (rc == 0)
+		return 0;
+
+	/* Only name lookups are worth retrying: no host, or a caller that
+	 * wants a numeric-only or non-IPv4 answer, we leave to glibc. */
+	if (!node || !*node)
+		return rc;
+	if (hints) {
+		if (hints->ai_flags & AI_NUMERICHOST)
+			return rc;
+		if (hints->ai_family != AF_UNSPEC &&
+		    hints->ai_family != AF_INET)
+			return rc;
+	}
+
+	dlog("real getaddrinfo(%s) failed rc=%d -> fallback", node, rc);
+
+	nns = load_nameservers(ns);
+	for (int i = 0; i < nns; i++) {
+		int found = query_a(ns[i], node, addrs, SHIM_MAX_ADDRS);
+
+		if (found > 0) {
+			int brc = build_result(addrs, found,
+					       resolve_port(service),
+					       hints, res);
+			if (brc != 0)
+				return brc;
+			dlog("fallback resolved %s -> %d address(es)",
+			     node, found);
+			return 0;
+		}
+	}
+	dlog("fallback failed for %s (%d nameserver(s) tried)", node, nns);
+	return rc;
+}

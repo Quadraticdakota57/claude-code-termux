@@ -1,0 +1,548 @@
+#!/data/data/com.termux/files/usr/bin/bash
+#
+# claude-code-termux — install & manage Claude Code on Termux.
+#
+# Claude Code >=2.x ships as a native binary. Anthropic's postinstall maps
+# android -> @anthropic-ai/claude-code-linux-arm64-android, a package they
+# never published (npm 404), so `claude` stays a dead stub on Termux. This
+# tool fetches the glibc linux-arm64 build instead and runs it through the
+# glibc-runner dynamic linker (ld.so).
+#
+# Subcommands:
+#   install [version]   Download the glibc binary + install the launcher
+#   update              Re-download to match the installed npm package version
+#   uninstall           Remove the binary, launcher, and (optional) npm package
+#   doctor              Health-check: deps, arch, binary, PATH, version drift
+#   build-shim          Compile the DNS fallback shim (see below)
+#   launcher-path       Print the launcher script path (for debugging)
+#   manager-path        Print where this script gets installed to
+#
+# Usage:
+#   claude-code-termux install          # match installed npm version
+#   claude-code-termux install 2.1.220  # pin a version
+#   claude-code-termux update
+#   claude-code-termux uninstall        # keep npm package
+#   claude-code-termux uninstall --purge# also remove the npm package
+#   claude-code-termux doctor           # exits nonzero if anything is broken
+#
+# The launcher goes in ~/.local/bin, which is NOT on Termux's default PATH.
+# Add it if `install` says so:  export PATH="$HOME/.local/bin:$PATH"
+#
+# Some ROMs symlink /etc to a read-only /system/etc with no resolv.conf, so
+# glibc's resolver has no nameservers and every lookup fails with
+# "getaddrinfo ENOTIMP". `install` detects that and builds shim_dns.c, a small
+# LD_PRELOAD getaddrinfo fallback; `build-shim` rebuilds it on demand.
+#
+# Requires: node, npm, glibc-runner (pkg install glibc-runner).
+# The shim additionally needs the glibc cross-compiler that glibc-runner ships.
+
+set -euo pipefail
+
+APP_PREFIX="${APP_PREFIX:-/data/data/com.termux/files/usr}"
+GLIBC_PREFIX="${GLIBC_PREFIX:-$APP_PREFIX/glibc}"
+PKG_DIR="$APP_PREFIX/lib/node_modules/@anthropic-ai/claude-code"
+BIN_DEST="$PKG_DIR/bin/claude-native"
+LAUNCHER="$HOME/.local/bin/claude"
+SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+SELF_DIR="$(dirname "$SELF")"
+
+# Where the launcher should look for this manager. $SELF is wherever the script
+# happens to sit right now — a clone, /tmp, a curl|bash shell — so baking it
+# into the launcher leaves a dangling path once that location moves. Install a
+# copy of ourselves next to the launcher and point the launcher at that.
+MANAGER_HOME="${CLAUDE_TERMUX_HOME:-$HOME/.local/share/claude-code-termux}"
+MANAGER_DEST="$MANAGER_HOME/claude-code-termux"
+SHIM_SRC_NAME="shim_dns.c"
+SHIM_BUILD_NAME="build-shim.sh"
+SHIM_DEST="${CLAUDE_DNS_SHIM:-$APP_PREFIX/lib/claude-dns-shim.so}"
+
+# Colors (disabled when not a TTY, so output is pipe-friendly).
+if [ -t 1 ]; then
+  C_BLUE='\033[1;34m'; C_GREEN='\033[1;32m'; C_RED='\033[1;31m'
+  C_YELLOW='\033[1;33m'; C_DIM='\033[2m'; C_RESET='\033[0m'
+else
+  C_BLUE=''; C_GREEN=''; C_RED=''; C_YELLOW=''; C_DIM=''; C_RESET=''
+fi
+FAILURES=0
+# Colors go through %b (which expands the \033 escapes) rather than being
+# interpolated into the format string: with colors disabled a message starting
+# with '-' would otherwise be parsed as a printf option, and any '%' in a
+# message would be read as a conversion.
+log()  { printf '%b[claude-termux]%b %s\n' "$C_BLUE"   "$C_RESET" "$*"; }
+ok()   { printf '%b[claude-termux]%b %s\n' "$C_GREEN"  "$C_RESET" "$*"; }
+warn() { printf '%b[claude-termux]%b %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+# Counts as well as prints, so `doctor` can exit nonzero for scripting/CI.
+# Warnings deliberately don't count — they're advisory, not broken state.
+err()  { FAILURES=$((FAILURES + 1)); printf '%b[claude-termux]%b %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+# --- architecture + glibc discovery --------------------------------------
+# Termux arch -> the linux-* npm package suffix Anthropic publishes.
+arch_suffix() {
+  case "$(uname -m)" in
+    aarch64|arm64) echo "linux-arm64" ;;
+    x86_64|amd64)  echo "linux-x64" ;;
+    *)             return 1 ;;
+  esac
+}
+
+# Locate the glibc dynamic linker + lib dir, independent of the prefix layout.
+glibc_lib_dir() {
+  for d in "$GLIBC_PREFIX/lib" "$APP_PREFIX/glibc/lib" /data/data/com.termux/files/usr/glibc/lib; do
+    if ls "$d"/ld-linux-*.so.* >/dev/null 2>&1; then echo "$d"; return 0; fi
+  done
+  return 1
+}
+
+glibc_ld() {
+  local libdir; libdir="$(glibc_lib_dir || true)"
+  [ -n "$libdir" ] || return 1
+  local ld; ld="$(ls "$libdir"/ld-linux-*.so.* 2>/dev/null | head -1)"
+  [ -n "$ld" ] && echo "$ld" || return 1
+}
+
+# Invoke the native binary through the glibc linker. Two variants:
+#   run_native     — exec's (replaces the process); for "become claude" use.
+#   run_native_cap — captures output; for internal version checks.
+# Both preload the DNS shim when present, so these exercise the same path the
+# launcher does — otherwise doctor's "run check" could pass on a broken shim.
+_glibc_env() {
+  local libdir ld
+  libdir="$(glibc_lib_dir)" || die "glibc lib dir not found — is glibc-runner installed?"
+  ld="$(glibc_ld)"          || die "glibc dynamic linker not found under $libdir"
+  echo "$libdir:$ld"
+}
+_preload_args() {
+  [ -f "$SHIM_DEST" ] && printf '%s\n%s\n' --preload "$SHIM_DEST"
+  return 0
+}
+run_native() {
+  local bin="$1"; shift
+  local gl; gl="$(_glibc_env)"
+  local libdir="${gl%%:*}" ld="${gl##*:}"
+  local pre=(); mapfile -t pre < <(_preload_args)
+  exec env -u LD_PRELOAD -u LD_LIBRARY_PATH "$ld" --library-path "$libdir" "${pre[@]}" "$bin" "$@"
+}
+run_native_cap() {
+  local bin="$1"; shift
+  local gl; gl="$(_glibc_env)"
+  local libdir="${gl%%:*}" ld="${gl##*:}"
+  local pre=(); mapfile -t pre < <(_preload_args)
+  env -u LD_PRELOAD -u LD_LIBRARY_PATH "$ld" --library-path "$libdir" "${pre[@]}" "$bin" "$@"
+}
+
+# --- helpers --------------------------------------------------------------
+is_real_binary() {
+  # The shipped stub is a 500-byte shell script; a real ELF is not text.
+  [ -f "$1" ] && [ -x "$1" ] && ! grep -qI . "$1" 2>/dev/null
+}
+
+pkg_version() {
+  [ -f "$PKG_DIR/package.json" ] || return 1
+  node -e "console.log(require('$PKG_DIR/package.json').version)" 2>/dev/null
+}
+
+binary_version() {
+  is_real_binary "$BIN_DEST" || return 1
+  run_native_cap "$BIN_DEST" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
+}
+
+DEPS_CHECKED=0
+check_deps() {
+  # `update` checks deps then delegates to `install`, which checks again.
+  # Idempotent guard keeps that a no-op instead of duplicate work.
+  [ "$DEPS_CHECKED" = 1 ] && return 0
+  DEPS_CHECKED=1
+  command -v node >/dev/null 2>&1 || die "node not found. Install: pkg install nodejs"
+  command -v npm  >/dev/null 2>&1 || die "npm not found."
+  command -v grun >/dev/null 2>&1 || glibc_ld >/dev/null 2>&1 || {
+    err "glibc-runner not found. The Claude binary needs a glibc runtime."
+    err "Install with: pkg install glibc-runner"
+    exit 1
+  }
+  glibc_ld >/dev/null 2>&1 || {
+    err "glibc dynamic linker (ld-linux-*.so.*) not found under $GLIBC_PREFIX."
+    err "Reinstall glibc: pkg install glibc-runner"
+    exit 1
+  }
+}
+
+# Warn if the launcher's directory isn't on PATH. Without this a fresh user
+# sees "Done. Run: claude --version" and then "command not found", because
+# ~/.local/bin is not on Termux's default PATH.
+check_launcher_path() {
+  local dir; dir="$(dirname "$LAUNCHER")"
+  case ":$PATH:" in
+    *":$dir:"*) return 0 ;;
+  esac
+  warn "$dir is not on your PATH — 'claude' won't resolve yet."
+  warn "  Add to ~/.bashrc:  export PATH=\"$dir:\$PATH\""
+  return 1
+}
+
+# Does glibc have any usable resolver config? On ROMs where /etc -> /system/etc
+# is read-only and has no resolv.conf, the answer is no and every lookup dies
+# with "getaddrinfo ENOTIMP" — that's what the DNS shim exists to paper over.
+resolver_config_ok() {
+  for f in /etc/resolv.conf "$APP_PREFIX/etc/resolv.conf"; do
+    [ -s "$f" ] && grep -q '^[[:space:]]*nameserver' "$f" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+# Build the DNS shim from source if we can find it. Non-fatal: the shim is only
+# needed on affected ROMs, and the launcher preloads it only when it exists.
+build_dns_shim() {
+  local builder="$SELF_DIR/$SHIM_BUILD_NAME"
+  local src="$SELF_DIR/$SHIM_SRC_NAME"
+
+  [ -f "$builder" ] && [ -f "$src" ] || {
+    warn "DNS shim source not found next to $SELF — skipping."
+    warn "  Without it, lookups may fail with 'getaddrinfo ENOTIMP' on some ROMs."
+    return 1
+  }
+  log "Building DNS shim (no usable resolv.conf detected) ..."
+  if bash "$builder" "$SHIM_DEST" >/dev/null 2>&1; then
+    ok "DNS shim built at $SHIM_DEST"
+    # Keep the source alongside the installed manager so `update` can rebuild
+    # it later even if the original checkout is gone.
+    mkdir -p "$MANAGER_HOME"
+    cp -f "$src" "$builder" "$MANAGER_HOME/" 2>/dev/null || true
+    return 0
+  fi
+  warn "DNS shim build failed — continuing without it."
+  warn "  Retry manually: $builder $SHIM_DEST"
+  return 1
+}
+
+# Copy ourselves (plus shim sources) to a stable location the launcher can
+# reference for self-healing. See MANAGER_DEST for why.
+install_manager_copy() {
+  mkdir -p "$MANAGER_HOME"
+  if [ "$SELF" != "$MANAGER_DEST" ]; then
+    cp -f "$SELF" "$MANAGER_DEST" && chmod 755 "$MANAGER_DEST"
+  fi
+  for f in "$SHIM_SRC_NAME" "$SHIM_BUILD_NAME"; do
+    [ -f "$SELF_DIR/$f" ] && cp -f "$SELF_DIR/$f" "$MANAGER_HOME/$f" 2>/dev/null || true
+  done
+  chmod 755 "$MANAGER_HOME/$SHIM_BUILD_NAME" 2>/dev/null || true
+}
+
+# Download + extract the glibc native binary for a given version.
+fetch_binary() {
+  local version="$1" arch="$2"
+  local pkg="@anthropic-ai/claude-code-${arch}@${version}"
+  local tmp; tmp="$(mktemp -d)"; trap "rm -rf '$tmp'; trap - RETURN" RETURN
+
+  log "Fetching $pkg ..."
+  if ! npm pack "$pkg" --pack-destination "$tmp" >/dev/null 2>&1; then
+    err "Download failed for $pkg."
+    err "Verify the version: npm view @anthropic-ai/claude-code-${arch} versions"
+    return 1
+  fi
+
+  tar -xzf "$tmp"/*.tgz -C "$tmp"
+  local src="$tmp/package/claude"
+  [ -f "$src" ] || { err "Package $pkg has no 'claude' binary."; return 1; }
+
+  mkdir -p "$(dirname "$BIN_DEST")"
+  cp "$src" "$BIN_DEST"
+  chmod 755 "$BIN_DEST"
+}
+
+# Write the launcher that runs the glibc binary via ld.so (lean: no grun
+# bashrc overhead). Embedded as a heredoc with a marker line so we can tell
+# our launcher apart from a user's own `claude` script.
+write_launcher() {
+  mkdir -p "$(dirname "$LAUNCHER")"
+  local libdir; libdir="$(glibc_lib_dir)"
+  local ld;     ld="$(glibc_ld)"
+  cat > "$LAUNCHER" <<LAUNCHER_EOF
+#!/data/data/com.termux/files/usr/bin/bash
+# claude-termux launcher (managed by claude-code-termux) — DO NOT EDIT
+# Runs the glibc Claude binary via the glibc dynamic linker.
+set -euo pipefail
+BIN="\${CLAUDE_NATIVE:-$BIN_DEST}"
+GLIBCLIB="\${GLIBC_LIB_DIR:-$libdir}"
+GLIBCLD="\${GLIBC_LD:-$ld}"
+# DNS shim: this ROM's /etc -> /system/etc is read-only and has no
+# resolv.conf, so glibc's resolver has zero nameservers and every lookup
+# fails with "getaddrinfo ENOTIMP". The shim provides its own getaddrinfo
+# fallback. Only active when the file exists.
+DNS_SHIM="\${CLAUDE_DNS_SHIM:-$SHIM_DEST}"
+PRELOAD_ARGS=()
+if [ -f "\$DNS_SHIM" ]; then
+  PRELOAD_ARGS=(--preload "\$DNS_SHIM")
+fi
+# Claude Code's shell snapshot defines wrapper functions (grep, find, ...) that
+# re-invoke \$CLAUDE_CODE_EXECPATH. Left unset it defaults to argv[0], which is
+# the glibc loader here (we exec ld.so, not the binary) — so the wrapper runs
+# 'ld.so -G pattern' and dies with "-G: cannot open shared object file".
+# Pin it to this launcher so those wrappers re-enter through us.
+export CLAUDE_CODE_EXECPATH="$LAUNCHER"
+# Self-heal via the managed copy of the manager, not wherever it was run from
+# the first time: that could have been a clone, /tmp, or a curl|bash shell.
+MANAGER="\${CLAUDE_TERMUX_MANAGER:-$MANAGER_DEST}"
+# Bootstrap if the binary is missing or is still the shipped stub.
+if [ ! -f "\$BIN" ] || grep -qI . "\$BIN" 2>/dev/null; then
+  [ -x "\$MANAGER" ] && "\$MANAGER" install >/dev/null 2>&1 || true
+fi
+if [ ! -f "\$BIN" ] || grep -qI . "\$BIN" 2>/dev/null; then
+  echo "claude-termux: native binary not found at \$BIN" >&2
+  if [ -x "\$MANAGER" ]; then
+    echo "  Run: \$MANAGER install" >&2
+  else
+    echo "  The claude-code-termux manager is missing from \$MANAGER." >&2
+    echo "  Re-run 'claude-code-termux install' from a checkout to restore it." >&2
+  fi
+  exit 127
+fi
+exec env -u LD_PRELOAD -u LD_LIBRARY_PATH "\$GLIBCLD" --library-path "\$GLIBCLIB" "\${PRELOAD_ARGS[@]}" "\$BIN" "\$@"
+LAUNCHER_EOF
+  chmod 755 "$LAUNCHER"
+}
+
+is_our_launcher() {
+  [ -f "$LAUNCHER" ] && grep -q 'claude-termux launcher (managed' "$LAUNCHER" 2>/dev/null
+}
+
+# --- subcommands ----------------------------------------------------------
+cmd_install() {
+  check_deps
+  local version="${1:-}"
+  local arch; arch="$(arch_suffix)" || die "Unsupported arch: $(uname -m). Only arm64/x86_64."
+
+  if [ -z "$version" ]; then
+    version="$(pkg_version)" || die "Claude Code npm package not found at $PKG_DIR."$'\n'"  Run: npm install -g @anthropic-ai/claude-code"
+  fi
+  log "Version: $version  (arch: $arch)"
+
+  if is_real_binary "$BIN_DEST" && [ "$(binary_version 2>/dev/null)" = "$version" ]; then
+    ok "Binary already up to date ($version) — skipping download."
+  else
+    fetch_binary "$version" "$arch" || exit 1
+    ok "Binary placed at $BIN_DEST"
+    run_native_cap "$BIN_DEST" --version >/dev/null 2>&1 || die "Binary failed to start."
+    ok "Verified: $(run_native_cap "$BIN_DEST" --version 2>/dev/null)"
+  fi
+
+  # Install our own copy first: write_launcher points the launcher's self-heal
+  # path at it, so it has to exist before the launcher is written.
+  install_manager_copy
+  ok "Manager installed at $MANAGER_DEST"
+
+  # The shim is only needed where glibc has no resolver config at all. Building
+  # it unconditionally would waste a compile on most devices.
+  if [ -f "$SHIM_DEST" ]; then
+    ok "DNS shim present at $SHIM_DEST"
+  elif resolver_config_ok; then
+    log "Resolver config looks fine — skipping DNS shim."
+  else
+    build_dns_shim || true
+  fi
+
+  # Always reconcile the launcher — upgrade a stale one or adopt an existing
+  # foreign `claude` script. Never leave a launcher pointing at a deleted
+  # manager or using the slower grun path.
+  if is_our_launcher; then
+    log "Refreshing managed launcher paths at $LAUNCHER"
+  else
+    [ -e "$LAUNCHER" ] && warn "Adopting/overwriting existing $LAUNCHER"
+  fi
+
+  write_launcher
+  ok "Launcher ready at $LAUNCHER"
+
+  if check_launcher_path; then
+    ok "Done. Run: claude --version"
+  else
+    ok "Done. Run: $LAUNCHER --version   (or add the directory to PATH, above)"
+  fi
+}
+cmd_update() {
+  check_deps
+  local want; want="$(pkg_version 2>/dev/null)" || die "npm package not found."
+  local have; have="$(binary_version 2>/dev/null || echo none)"
+
+  if [ "$have" = "$want" ]; then
+    ok "Already current: $want. (force: rm '$BIN_DEST' && $SELF install)"
+    return 0
+  fi
+  log "Updating binary: $have -> $want"
+  rm -f "$BIN_DEST"
+  cmd_install "$want"
+}
+
+cmd_uninstall() {
+  local purge=0
+  for a in "$@"; do
+    case "$a" in
+      --purge|-p) purge=1 ;;
+      -h|--help|help)
+        echo "Usage: $(basename "$SELF") uninstall [--purge]"
+        echo
+        echo "Removes the native binary, the managed launcher, the DNS shim and"
+        echo "the manager copy under $MANAGER_HOME."
+        echo "  --purge, -p   also 'npm uninstall -g @anthropic-ai/claude-code'"
+        return 0
+        ;;
+      *) die "uninstall: unknown flag '$a' (expected --purge)" ;;
+    esac
+  done
+
+  local removed=0
+  if is_real_binary "$BIN_DEST"; then
+    rm -f "$BIN_DEST"; log "Removed binary: $BIN_DEST"; removed=1
+  else
+    warn "No managed binary at $BIN_DEST."
+  fi
+
+  if is_our_launcher; then
+    rm -f "$LAUNCHER"; log "Removed launcher: $LAUNCHER"; removed=1
+  else
+    warn "$LAUNCHER is not managed by this tool — leaving as-is."
+    warn "(remove manually if desired: rm '$LAUNCHER')"
+  fi
+
+  if [ -f "$SHIM_DEST" ]; then
+    rm -f "$SHIM_DEST"; log "Removed DNS shim: $SHIM_DEST"; removed=1
+  fi
+
+  # Last, because this may be the very script that is running. Unlinking an
+  # open file is safe on Linux — bash keeps reading through its fd.
+  if [ -d "$MANAGER_HOME" ]; then
+    rm -rf "$MANAGER_HOME"; log "Removed manager copy: $MANAGER_HOME"; removed=1
+  fi
+
+  if [ "$purge" = 1 ]; then
+    if [ -d "$PKG_DIR" ]; then
+      log "Removing npm package (--purge)..."
+      npm uninstall -g @anthropic-ai/claude-code || warn "npm uninstall reported an error."
+    else
+      warn "npm package already absent."
+    fi
+    warn "Config left untouched: ~/.claude/ and ~/.claude.json"
+    warn "Remove manually if desired: rm -rf ~/.claude ~/.claude.json"
+  fi
+
+  [ "$removed" = 1 ] && ok "Uninstalled." || warn "Nothing to remove."
+}
+
+cmd_doctor() {
+  printf '%b--- claude-code-termux doctor ---%b\n' "$C_DIM" "$C_RESET"
+
+  # deps
+  command -v node >/dev/null 2>&1 && ok "node: $(node --version)" || err "node: MISSING"
+  command -v npm  >/dev/null 2>&1 && ok "npm: $(npm --version)"   || err "npm: MISSING"
+  command -v grun >/dev/null 2>&1 && ok "grun: present"            || warn "grun: not on PATH"
+
+  # arch
+  local arch; arch="$(arch_suffix 2>/dev/null)" \
+    && ok "arch: $(uname -m) -> $arch" || err "arch: $(uname -m) UNSUPPORTED (need arm64/x86_64)"
+
+  # glibc
+  local libdir ld
+  if libdir="$(glibc_lib_dir 2>/dev/null)" && ld="$(glibc_ld 2>/dev/null)"; then
+    ok "glibc lib dir: $libdir"
+    ok "glibc linker:  $ld"
+  else
+    err "glibc: NOT FOUND. Install: pkg install glibc-runner"
+  fi
+
+  # npm package
+  local pkgv; pkgv="$(pkg_version 2>/dev/null)" \
+    && ok "npm package: $pkgv at $PKG_DIR" \
+    || warn "npm package: not installed at $PKG_DIR"
+
+  # binary
+  if is_real_binary "$BIN_DEST"; then
+    local binv; binv="$(binary_version 2>/dev/null || echo 'FAILED TO RUN')"
+    ok "binary: $binv at $BIN_DEST"
+    if [ -n "${pkgv:-}" ] && [ -n "${binv:-}" ] && [ "$pkgv" != "$binv" ] \
+       && [ "$binv" != "FAILED TO RUN" ]; then
+      warn "  VERSION DRIFT: package=$pkgv binary=$binv  -> run: $SELF update"
+    fi
+  else
+    err "binary: MISSING or stub at $BIN_DEST  -> run: $SELF install"
+  fi
+
+  # launcher
+  if is_our_launcher; then
+    ok "launcher: managed at $LAUNCHER"
+  elif [ -e "$LAUNCHER" ]; then
+    warn "launcher: $LAUNCHER exists but is not managed (user-owned?)"
+  else
+    err "launcher: MISSING at $LAUNCHER  -> run: $SELF install"
+  fi
+
+  # PATH — the launcher can be perfect and still not be reachable as `claude`.
+  # check_launcher_path prints its own guidance on failure.
+  check_launcher_path && ok "PATH: $(dirname "$LAUNCHER") is on PATH" || true
+
+  # manager copy — the launcher's self-heal target
+  if [ -x "$MANAGER_DEST" ]; then
+    ok "manager copy: $MANAGER_DEST"
+  else
+    warn "manager copy: missing at $MANAGER_DEST (launcher can't self-heal)"
+    warn "  -> run: $SELF install"
+  fi
+
+  # DNS shim — only actually required where glibc has no resolver config.
+  if [ -f "$SHIM_DEST" ]; then
+    ok "dns shim: $SHIM_DEST"
+  elif resolver_config_ok; then
+    ok "dns shim: not installed (not needed — resolv.conf has nameservers)"
+  else
+    err "dns shim: MISSING and no usable resolv.conf found"
+    err "  glibc lookups will fail with 'getaddrinfo ENOTIMP'."
+    err "  -> run: $SELF build-shim"
+  fi
+
+  # quick run
+  if is_real_binary "$BIN_DEST"; then
+    if run_native_cap "$BIN_DEST" --version >/dev/null 2>&1; then
+      ok "run check: $(run_native_cap "$BIN_DEST" --version 2>/dev/null)"
+    else
+      err "run check: binary failed to execute"
+    fi
+  fi
+
+  if [ "$FAILURES" -gt 0 ]; then
+    printf '%b%s problem(s) found.%b\n' "$C_RED" "$FAILURES" "$C_RESET" >&2
+    return 1
+  fi
+  ok "All checks passed."
+}
+
+# Build (or rebuild) the DNS shim on demand, from the checkout or the installed
+# copy. Unlike the install path this one is fatal on failure — the user asked
+# for it explicitly, so silence would be wrong.
+cmd_build_shim() {
+  local builder src
+  for d in "$SELF_DIR" "$MANAGER_HOME"; do
+    if [ -f "$d/$SHIM_BUILD_NAME" ] && [ -f "$d/$SHIM_SRC_NAME" ]; then
+      builder="$d/$SHIM_BUILD_NAME"; src="$d/$SHIM_SRC_NAME"; break
+    fi
+  done
+  [ -n "${builder:-}" ] || die "shim sources ($SHIM_SRC_NAME, $SHIM_BUILD_NAME) not found in $SELF_DIR or $MANAGER_HOME."
+  log "Building $SHIM_SRC_NAME from $(dirname "$src") ..."
+  bash "$builder" "$SHIM_DEST" || die "shim build failed."
+  ok "DNS shim installed at $SHIM_DEST"
+  is_our_launcher && log "Launcher will preload it on the next run."
+  return 0
+}
+
+# --- dispatch -------------------------------------------------------------
+case "${1:-}" in
+  install)         shift; cmd_install "$@" ;;
+  update)          shift; cmd_update ;;
+  uninstall|remove)shift; cmd_uninstall "$@" ;;
+  doctor|status)   shift; cmd_doctor ;;
+  build-shim)      shift; cmd_build_shim ;;
+  launcher-path)   echo "$LAUNCHER" ;;
+  manager-path)    echo "$MANAGER_DEST" ;;
+  ""|-h|--help|help)
+    sed -n '2,/^$/p' "$SELF" | sed 's/^# \{0,1\}//'
+    ;;
+  *) die "Unknown command '$1'. Run: $(basename "$SELF") help" ;;
+esac
