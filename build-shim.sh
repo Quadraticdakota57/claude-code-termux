@@ -3,8 +3,10 @@
 # build-shim.sh — compile claude-dns-shim.so from shim_dns.c.
 #
 # The shim is LD_PRELOAD'ed into the *glibc* Claude binary, so it must be
-# built against glibc — not Termux's bionic libc. glibc-runner ships a
-# suitable cross-compiler at $GLIBC_PREFIX/bin/aarch64-linux-gnu-gcc.
+# built against glibc — not Termux's bionic libc. The compiler for that comes
+# from the gcc-glibc package, which glibc-runner does NOT depend on:
+#
+#   pkg install gcc-glibc
 #
 # Two quirks of that toolchain, both handled below:
 #
@@ -27,12 +29,14 @@ GLIBC_PREFIX="${GLIBC_PREFIX:-$APP_PREFIX/glibc}"
 SRC="$(dirname "$(readlink -f "$0")")/shim_dns.c"
 OUT="${1:-$APP_PREFIX/lib/claude-dns-shim.so}"
 
-CC="$GLIBC_PREFIX/bin/aarch64-linux-gnu-gcc"
+# Plain `gcc` rather than aarch64-linux-gnu-gcc: it's a symlink to whichever
+# triplet this install ships, so the same line works on x86_64.
+CC="${CC:-$GLIBC_PREFIX/bin/gcc}"
 
 [ -f "$SRC" ] || { echo "build-shim: source not found: $SRC" >&2; exit 1; }
 [ -x "$CC" ] || {
-  echo "build-shim: glibc cross-compiler not found at $CC" >&2
-  echo "  Install it with: pkg install glibc-runner" >&2
+  echo "build-shim: glibc C compiler not found at $CC" >&2
+  echo "  Install it with: pkg install gcc-glibc" >&2
   exit 1
 }
 

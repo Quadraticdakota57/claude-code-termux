@@ -8,10 +8,22 @@ Anthropic's real `linux-arm64` binary and runs it natively under Termux via
 `glibc-runner`. Works on arm64 and x86_64.
 
 ```sh
-pkg install nodejs glibc-runner
-npm install -g @anthropic-ai/claude-code
-git clone https://github.com/bd-loser/claude-code-termux
-cd claude-code-termux && ./claude-code-termux install
+curl -fsSL https://raw.githubusercontent.com/bd-loser/claude-code-termux/main/install.sh | bash
+```
+
+That's the whole install. It pulls the dependencies, fetches Claude Code, sets
+up the launcher, and puts `~/.local/bin` on your `PATH`. Then:
+
+```sh
+exec bash   # only needed the first time, to pick up PATH
+claude
+```
+
+Prefer to read before you run? Same thing, in two steps:
+
+```sh
+curl -fsSL -o install.sh https://raw.githubusercontent.com/bd-loser/claude-code-termux/main/install.sh
+less install.sh && bash install.sh
 ```
 
 If you landed here from one of these errors, you're in the right place:
@@ -47,13 +59,16 @@ GitHub — the Play Store build is too old), and roughly 1.5 GB free for
 `glibc-runner` plus the ~270 MB binary.
 
 ```sh
-pkg install nodejs glibc-runner
+pkg install nodejs glibc-runner gcc-glibc
 npm install -g @anthropic-ai/claude-code   # gives you the stub + version info
 
 git clone https://github.com/bd-loser/claude-code-termux
 cd claude-code-termux
 ./claude-code-termux install
 ```
+
+(`gcc-glibc` is only needed if your device turns out to need the
+[DNS shim](#the-dns-shim). Harmless to install either way.)
 
 `~/.local/bin` is **not** on Termux's default `PATH`. If `install` tells you so,
 add it:
@@ -130,8 +145,9 @@ claude-code-termux build-shim
 CLAUDE_DNS_SHIM_DEBUG=1 claude --version   # trace shim decisions on stderr
 ```
 
-Building it needs the glibc cross-compiler that `glibc-runner` ships. Two
-toolchain quirks `build-shim.sh` works around, in case you build by hand:
+Building it needs `gcc-glibc` (a separate package — `glibc-runner` does not pull
+it in). Two toolchain quirks `build-shim.sh` works around, in case you build by
+hand:
 
 - the glibc sysroot has no kernel UAPI headers (its `include/asm` is a broken
   symlink), so the build adds `-idirafter $PREFIX/include` to borrow Termux's —
@@ -201,6 +217,12 @@ runs Termux on arm64 or x86_64 should be fine.
 (`@anthropic-ai/claude-code-linux-arm64`), fetched with `npm pack` from the
 public registry. Nothing is patched or repackaged. The only original binary
 component is `shim_dns.c`, which is in this repo and compiled on your device.
+To build the shim you need `gcc-glibc` — note that `glibc-runner` does NOT
+pull it in as a dependency:
+
+```sh
+pkg install gcc-glibc
+```
 
 **Does it work with a Claude Pro/Max subscription and with API keys?** Yes —
 it's the stock binary, so authentication behaves exactly as it does on desktop.

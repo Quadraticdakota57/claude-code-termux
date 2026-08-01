@@ -33,8 +33,9 @@
 # "getaddrinfo ENOTIMP". `install` detects that and builds shim_dns.c, a small
 # LD_PRELOAD getaddrinfo fallback; `build-shim` rebuilds it on demand.
 #
-# Requires: node, npm, glibc-runner (pkg install glibc-runner).
-# The shim additionally needs the glibc cross-compiler that glibc-runner ships.
+# Requires: node, npm, glibc-runner (pkg install nodejs glibc-runner).
+# Building the DNS shim additionally needs gcc-glibc — note that glibc-runner
+# does NOT pull it in, so `pkg install gcc-glibc` separately if you need it.
 
 set -euo pipefail
 
@@ -52,6 +53,10 @@ SELF_DIR="$(dirname "$SELF")"
 # copy of ourselves next to the launcher and point the launcher at that.
 MANAGER_HOME="${CLAUDE_TERMUX_HOME:-$HOME/.local/share/claude-code-termux}"
 MANAGER_DEST="$MANAGER_HOME/claude-code-termux"
+# Symlinked next to the launcher so `claude-code-termux doctor` works from any
+# directory once ~/.local/bin is on PATH — the manager itself lives in a
+# share/ dir that nobody would put on their PATH.
+MANAGER_LINK="$(dirname "$LAUNCHER")/claude-code-termux"
 SHIM_SRC_NAME="shim_dns.c"
 SHIM_BUILD_NAME="build-shim.sh"
 SHIM_DEST="${CLAUDE_DNS_SHIM:-$APP_PREFIX/lib/claude-dns-shim.so}"
@@ -211,7 +216,8 @@ build_dns_shim() {
     return 0
   fi
   warn "DNS shim build failed — continuing without it."
-  warn "  Retry manually: $builder $SHIM_DEST"
+  warn "  Needs the glibc compiler: pkg install gcc-glibc"
+  warn "  Then retry: $builder $SHIM_DEST"
   return 1
 }
 
@@ -226,6 +232,15 @@ install_manager_copy() {
     [ -f "$SELF_DIR/$f" ] && cp -f "$SELF_DIR/$f" "$MANAGER_HOME/$f" 2>/dev/null || true
   done
   chmod 755 "$MANAGER_HOME/$SHIM_BUILD_NAME" 2>/dev/null || true
+
+  # Put the manager on PATH too, so `claude-code-termux doctor` just works.
+  # Skip if the user has their own non-symlink file sitting there.
+  mkdir -p "$(dirname "$MANAGER_LINK")"
+  if [ -e "$MANAGER_LINK" ] && [ ! -L "$MANAGER_LINK" ]; then
+    warn "$MANAGER_LINK exists and is not a symlink — leaving it alone."
+  else
+    ln -sf "$MANAGER_DEST" "$MANAGER_LINK"
+  fi
 }
 
 # Download + extract the glibc native binary for a given version.
@@ -406,6 +421,12 @@ cmd_uninstall() {
 
   if [ -f "$SHIM_DEST" ]; then
     rm -f "$SHIM_DEST"; log "Removed DNS shim: $SHIM_DEST"; removed=1
+  fi
+
+  # Only remove the symlink if it points into our own manager home — never a
+  # user's own file of the same name.
+  if [ -L "$MANAGER_LINK" ] && [ "$(readlink -f "$MANAGER_LINK")" = "$(readlink -f "$MANAGER_DEST")" ]; then
+    rm -f "$MANAGER_LINK"; log "Removed symlink: $MANAGER_LINK"; removed=1
   fi
 
   # Last, because this may be the very script that is running. Unlinking an
